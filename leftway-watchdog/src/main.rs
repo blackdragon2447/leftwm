@@ -4,7 +4,6 @@
 //! `leftwm-{check, command, state, theme}` as specified, and passes along any extra arguments.
 
 use clap::command;
-use leftwm_core::child_process::{self, Nanny};
 use std::env;
 use std::path::Path;
 use std::process::{exit, Child, Command, ExitStatus};
@@ -12,6 +11,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+
+mod utils;
 
 type Subcommand<'a> = &'a str;
 type SubcommandArgs = Vec<String>;
@@ -21,13 +22,12 @@ const SUBCOMMAND_PREFIX: &str = "leftwm-";
 
 const SUBCOMMAND_NAME_INDEX: usize = 0;
 const SUBCOMMAND_DESCRIPTION_INDEX: usize = 1;
-const AVAILABLE_SUBCOMMANDS: [[&str; 2]; 6] = [
+const AVAILABLE_SUBCOMMANDS: [[&str; 2]; 5] = [
     ["check", "Check syntax of the configuration file"],
     ["command", "Send external commands to LeftWM"],
     ["state", "Print the current state of LeftWM"],
     ["theme", "Manage LeftWM themes"],
     ["config", "Manage LeftWM configuration file"],
-    ["log", "Retrieves information logged by leftwm-worker"],
 ];
 
 fn main() {
@@ -85,7 +85,7 @@ fn print_help_page() {
              it is installed.",
         )
         .subcommands(subcommands)
-        .help_template(leftwm::utils::get_help_template())
+        .help_template(utils::get_help_template())
         .print_help()
         .unwrap();
 }
@@ -158,42 +158,34 @@ fn start_leftwm() {
     set_env_vars();
 
     // Boot everything WM agnostic or LeftWM related in ~/.config/autostart
-    let mut children = Nanny::autostart();
+    let mut children = utils::autostart();
 
     let flag = get_sigchld_flag();
 
-    let mut error_occured = false;
-    let mut session_exit_status: Option<ExitStatus> = None;
-    while !error_occured {
-        let mut leftwm_session = start_leftwm_session(&current_exe);
-        #[cfg(feature = "lefthk")]
-        let mut lefthk_session = start_lefthk_session(&current_exe);
+    let mut leftwm_session = start_leftwm_session(&current_exe);
 
-        while session_is_running(&mut leftwm_session) {
-            // remove all child processes which finished
-            children.remove_finished_children();
+    while session_is_running(&mut leftwm_session) {
+        // remove all child processes which finished
+        utils::remove_finished_children(&mut children);
 
-            while is_suspending(&flag) {
-                nix::unistd::pause();
-            }
+        while is_suspending(&flag) {
+            nix::unistd::pause();
         }
+    }
 
-        // we don't want a rougue lefthk session so we kill it when the leftwm one ended
-        #[cfg(feature = "lefthk")]
-        kill_lefthk_session(&mut lefthk_session);
+    // we don't want a rougue lefthk session so we kill it when the leftwm one ended
 
-        session_exit_status = get_exit_status(&mut leftwm_session);
-        error_occured = check_error_occured(session_exit_status);
+    let session_exit_status = get_exit_status(&mut leftwm_session);
+    let error_occured = check_error_occured(session_exit_status);
 
-        // TODO: either add more details or find a better workaround.
-        //
-        // Left is too fast for some login managers. We need to
-        // wait to give the login manager a second to boot.
-        #[cfg(feature = "slow-dm-fix")]
-        {
-            let delay = std::time::Duration::from_millis(2000);
-            std::thread::sleep(delay);
-        }
+    // TODO: either add more details or find a better workaround.
+    //
+    // Left is too fast for some login managers. We need to
+    // wait to give the login manager a second to boot.
+    #[cfg(feature = "slow-dm-fix")]
+    {
+        let delay = std::time::Duration::from_millis(2000);
+        std::thread::sleep(delay);
     }
 
     if error_occured {
@@ -216,33 +208,11 @@ fn session_is_running(leftwm_session: &mut Child) -> bool {
 
 /// starts the leftwm session and returns the process/leftwm-session
 fn start_leftwm_session(current_exe: &Path) -> Child {
-    let worker_file = current_exe.with_file_name("leftwm-worker");
+    let worker_file = current_exe.with_file_name("leftway-worker");
 
     Command::new(worker_file)
         .spawn()
         .expect("failed to start leftwm")
-}
-
-/// Starts the lefthk session and returns the process/lefthk-session
-#[cfg(feature = "lefthk")]
-fn start_lefthk_session(current_exe: &Path) -> Child {
-    let worker_file = current_exe.with_file_name("lefthk-worker");
-
-    Command::new(worker_file)
-        .spawn()
-        .expect("failed to start lefthk")
-}
-
-/// Kills the lefthk session
-#[cfg(feature = "lefthk")]
-fn kill_lefthk_session(lefthk_session: &mut Child) {
-    if lefthk_session.kill().is_ok() {
-        while lefthk_session
-            .try_wait()
-            .expect("failed to reap lefthk")
-            .is_none()
-        {}
-    }
 }
 
 /// The SIGCHLD can be set by the children of leftwm if their window need a refresh for example.
@@ -251,7 +221,7 @@ fn kill_lefthk_session(lefthk_session: &mut Child) {
 /// example-description.
 fn get_sigchld_flag() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
-    child_process::register_child_hook(flag.clone());
+    utils::register_child_hook(flag.clone());
 
     flag
 }
